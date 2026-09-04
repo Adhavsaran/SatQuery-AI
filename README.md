@@ -1,4 +1,4 @@
-# SatQuery AI - Phase 1: Backend Infrastructure
+# SatQuery AI
 
 **An Autonomous Vision-Language Assistant for Multimodal Remote Sensing Image Analysis**
 
@@ -6,7 +6,7 @@
 
 SatQuery AI is a backend system that transforms natural language queries into evidence-grounded investigations of satellite imagery. It integrates vision-language models, geospatial GIS engines, and an autonomous planning agent.
 
-**Status**: Phase 1 - Backend Infrastructure (Development)
+**Status**: backend, validation, deterministic change/SAR/GIS and controlled agent execution are implemented. Optional VLM adapters are honest adapters, not downloaded models; see `IMPLEMENTATION_STATUS.md`.
 
 ## Architecture
 
@@ -80,7 +80,20 @@ SatQuery-AI/
 ```bash
 cd /home/adhavsaran/Documents/SatQuery-AI
 pip install -r requirements.txt
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
+
+## Current API and honest model behavior
+
+`GET /health`, `GET /models`, and `GET /tools` expose service status, model-adapter state, and the controlled tool allow-list. `POST /analyze` (also `/agent/query`) accepts the existing `QueryRequest` shape. Task aliases are available at `/vqa`, `/caption`, `/ground`, `/detect`, `/segment`, `/change`, `/sar`, and `/fusion`.
+
+For an end-to-end local deterministic example, supply two co-registered GeoTIFFs:
+
+```bash
+curl -X POST http://127.0.0.1:8000/analyze -H 'content-type: application/json' -d '{"query":"What changed between 2024 and 2026?", "images":[{"filepath":"/absolute/t1_2024.tif","modality":"optical"},{"filepath":"/absolute/t2_2026.tif","modality":"optical"}]}'
+```
+
+It will execute validation, metadata extraction, alignment-gated pixel change, evidence aggregation, and an auditable trace. VQA/captioning/grounding/detection/segmentation adapters do **not** emit results until their optional model runtime and actual weights are configured.
 
 **Dependencies include**:
 - FastAPI + Uvicorn (web framework)

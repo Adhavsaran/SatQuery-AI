@@ -19,7 +19,7 @@ def main():
     """Run the SatQuery backend."""
     logger.info("=" * 80)
     logger.info("SatQuery AI - Remote Sensing Vision-Language Assistant")
-    logger.info(f"Version: 0.1.0 (Phase 1)")
+    logger.info("Version: 0.2.0")
     logger.info("=" * 80)
 
     import uvicorn

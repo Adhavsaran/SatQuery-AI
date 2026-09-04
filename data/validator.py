@@ -1,301 +1,69 @@
-"""
-Data Validation - Image and Metadata Validation
-
-Complete input validation for satellite imagery.
-Determines modality, bands, CRS, resolution, and data quality.
-Never fabricates missing metadata.
-"""
-
-from typing import Optional, List, Dict, Tuple, Any
+"""Raster input validation and metadata extraction. No modality is guessed as fact."""
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from dataclasses import dataclass, asdict
+import hashlib, re
+from typing import Any, Optional
 import numpy as np
 import rasterio
-from rasterio.crs import CRS
-import geopandas as gpd
+from PIL import Image
 
+SUPPORTED = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
 @dataclass
 class ImageMetadata:
-    """Validated image metadata."""
-    filepath: str
-    format: str
-    modality: str  # optical, multispectral, sar, thermal, panchromatic, hyperspectral
-    width: int
-    height: int
-    bands: int
-    band_names: List[str]
-    crs: Optional[str]
-    resolution: Optional[Tuple[float, float]]  # (x, y) in CRS units
-    bounds: Optional[Tuple[float, float, float, float]]  # (left, bottom, right, top)
-    nodata_value: Optional[float]
-    dtype: str
-    acquisition_date: Optional[str]
-    temporal_coverage: Optional[str]
-    warnings: List[str] = None
-    
-    def __post_init__(self):
-        if self.warnings is None:
-            self.warnings = []
-
-
+    filepath: str; format: str; modality: str; width: int; height: int; bands: int; band_names: list[str]; crs: Optional[str]; resolution: Optional[tuple[float,float]]; bounds: Optional[tuple[float,float,float,float]]; nodata_value: Optional[float]; dtype: str; acquisition_date: Optional[str]; temporal_coverage: Optional[str] = None; transform: Optional[tuple[float,...]] = None; sensor_name: Optional[str] = None; file_sha256: Optional[str] = None; warnings: list[str] = field(default_factory=list)
+    def to_dict(self): return asdict(self)
 @dataclass
 class ValidationResult:
-    """Result of input validation."""
-    valid: bool
-    image_count: int
-    images: List[ImageMetadata]
-    task_type: str  # single_image, bi_temporal, optical_sar, multi_temporal, unknown
-    required_modalities: List[str]
-    errors: List[str]
-    warnings: List[str]
-
+    valid: bool; image_count: int; images: list[ImageMetadata]; task_type: str; required_modalities: list[str]; errors: list[str]; warnings: list[str]
 
 class DataValidator:
-    """Validate satellite imagery and metadata."""
-
-    OPTICAL_BANDS = {"B", "G", "R", "L", "PAN"}
-    MULTISPECTRAL_BANDS = {"B", "G", "R", "N", "RE1", "RE2", "RE3", "S1", "S2", "S3"}
-    SAR_BANDS = {"VV", "VH", "HH", "HV", "HX"}
-    THERMAL_BANDS = {"B10", "B11", "TIR1", "TIR2"}
-
-    def validate(self, image_paths: List[str], metadata: Optional[Dict] = None) -> ValidationResult:
-        """
-        Validate input images and metadata.
-        
-        Args:
-            image_paths: List of paths to image files
-            metadata: Optional user-provided metadata (query, date range, etc.)
-        
-        Returns:
-            ValidationResult with detailed validation info
-        """
-        if not image_paths:
-            return ValidationResult(
-                valid=False,
-                image_count=0,
-                images=[],
-                task_type="unknown",
-                required_modalities=[],
-                errors=["No images provided"],
-                warnings=[]
-            )
-
-        # Validate each image
-        validated_images = []
-        errors = []
-        warnings = []
-        
-        for path in image_paths:
-            try:
-                img_meta = self._validate_single_image(path)
-                validated_images.append(img_meta)
-            except Exception as e:
-                errors.append(f"Error validating {path}: {str(e)}")
-
-        if errors and not validated_images:
-            return ValidationResult(
-                valid=False,
-                image_count=len(image_paths),
-                images=[],
-                task_type="unknown",
-                required_modalities=[],
-                errors=errors,
-                warnings=warnings
-            )
-
-        # Determine task type from image count and modalities
-        task_type = self._infer_task_type(validated_images)
-        required_modalities = self._extract_modalities(validated_images)
-
-        # Cross-check compatibility
-        compatibility_issues = self._check_compatibility(validated_images)
-        warnings.extend(compatibility_issues)
-
-        is_valid = len(errors) == 0
-        
-        return ValidationResult(
-            valid=is_valid,
-            image_count=len(validated_images),
-            images=validated_images,
-            task_type=task_type,
-            required_modalities=required_modalities,
-            errors=errors,
-            warnings=warnings
-        )
-
-    def _validate_single_image(self, path: str) -> ImageMetadata:
-        """Validate a single image file."""
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        suffix = path.suffix.lower()
-        
-        # Try to open as raster
-        try:
-            with rasterio.open(path) as src:
-                return self._extract_raster_metadata(src, path)
-        except Exception:
-            pass
-
-        # Try to open as vector
-        try:
-            gdf = gpd.read_file(path)
-            return self._extract_vector_metadata(gdf, path)
-        except Exception:
-            raise ValueError(f"Cannot read file as raster or vector: {path}")
-
-    def _extract_raster_metadata(self, src, path: Path) -> ImageMetadata:
-        """Extract metadata from raster file."""
-        band_count = src.count
-        band_names = [f"Band_{i+1}" for i in range(band_count)]
-        
-        # Try to detect modality from band count and names
-        modality = self._detect_modality(band_count, band_names, src)
-        
-        # Get resolution (pixel size)
-        pixel_size_x = abs(src.transform.a)
-        pixel_size_y = abs(src.transform.e)
-        resolution = (pixel_size_x, pixel_size_y)
-
-        # Get bounds
-        left, bottom, right, top = src.bounds
-        bounds = (left, bottom, right, top)
-
-        # Get CRS string
-        crs_str = None
-        if src.crs:
-            crs_str = str(src.crs)
-
-        # Try to detect acquisition date from filename or metadata
-        acquisition_date = self._extract_date_from_path(str(path))
-
-        metadata = ImageMetadata(
-            filepath=str(path),
-            format=path.suffix.lower()[1:],
-            modality=modality,
-            width=src.width,
-            height=src.height,
-            bands=band_count,
-            band_names=band_names,
-            crs=crs_str,
-            resolution=resolution,
-            bounds=bounds,
-            nodata_value=src.nodata,
-            dtype=src.dtypes[0] if src.count > 0 else "unknown",
-            acquisition_date=acquisition_date,
-            temporal_coverage=None,
-        )
-
-        # Add warnings
-        if src.nodata is None and modality != "unknown":
-            metadata.warnings.append("No NoData value defined")
-        if src.crs is None:
-            metadata.warnings.append("No CRS defined")
-
-        return metadata
-
-    def _extract_vector_metadata(self, gdf, path: Path) -> ImageMetadata:
-        """Extract metadata from vector file."""
-        bounds = gdf.total_bounds  # (minx, miny, maxx, maxy)
-        
-        return ImageMetadata(
-            filepath=str(path),
-            format=path.suffix.lower()[1:],
-            modality="vector",
-            width=len(gdf),
-            height=1,
-            bands=len(gdf.columns),
-            band_names=list(gdf.columns),
-            crs=str(gdf.crs) if gdf.crs else None,
-            resolution=None,
-            bounds=(bounds[0], bounds[1], bounds[2], bounds[3]),
-            nodata_value=None,
-            dtype="vector",
-            acquisition_date=None,
-            temporal_coverage=None,
-        )
-
-    def _detect_modality(self, band_count: int, band_names: List[str], src) -> str:
-        """Detect image modality from band count and properties."""
-        # Try to detect from band count
-        if band_count == 1:
-            return "panchromatic"
-        elif band_count == 3:
-            return "optical"
-        elif band_count == 4:
-            # Could be RGB+NIR or could be something else
-            return "multispectral"
-        elif band_count in [10, 11, 12, 13]:
-            # Likely Sentinel-2 (12 bands)
-            return "multispectral"
-        elif band_count == 2:
-            # Likely SAR (VV, VH)
-            return "sar"
-        elif band_count in [10, 11]:
-            # Landsat thermal bands
-            return "thermal"
-        else:
-            return "multispectral"  # Default guess for multi-band
-
-    def _extract_date_from_path(self, path: str) -> Optional[str]:
-        """Try to extract acquisition date from filename."""
-        import re
-        
-        # Look for YYYY-MM-DD or YYYYMMDD patterns
-        date_pattern = r'(\d{4}[-_]?\d{2}[-_]?\d{2})'
-        match = re.search(date_pattern, path)
-        if match:
-            return match.group(1).replace('_', '-').replace('-', '-')
-        return None
-
-    def _infer_task_type(self, images: List[ImageMetadata]) -> str:
-        """Infer task type from image list."""
-        if len(images) == 0:
-            return "unknown"
-        elif len(images) == 1:
-            return "single_image_analysis"
-        elif len(images) == 2:
-            modalities = [img.modality for img in images]
-            if modalities[0] == modalities[1] == "optical" or modalities[0] == modalities[1] == "multispectral":
-                return "bi_temporal_analysis"
-            elif "sar" in modalities and ("optical" in modalities or "multispectral" in modalities):
-                return "optical_sar_analysis"
-            else:
-                return "multi_temporal_analysis"
-        else:
-            return "multi_temporal_analysis"
-
-    def _extract_modalities(self, images: List[ImageMetadata]) -> List[str]:
-        """Extract unique modalities from images."""
-        return list(set(img.modality for img in images))
-
-    def _check_compatibility(self, images: List[ImageMetadata]) -> List[str]:
-        """Check compatibility between images."""
-        warnings = []
-        
-        if len(images) < 2:
-            return warnings
-
-        # Check CRS compatibility
-        crss = [img.crs for img in images]
-        if len(set(crss)) > 1 and not all(c is None for c in crss):
-            warnings.append("Images have different CRS - reprojection may be needed")
-
-        # Check resolution compatibility
-        resolutions = [img.resolution for img in images]
-        if len(set(str(r) for r in resolutions if r)) > 1:
-            warnings.append("Images have different resolutions - resampling may be needed")
-
-        # Check spatial extent compatibility
-        bounds = [img.bounds for img in images if img.bounds]
-        if len(bounds) > 1:
-            # Check if bounds overlap
-            b0 = bounds[0]
-            b1 = bounds[1]
-            overlap = not (b0[2] < b1[0] or b1[2] < b0[0] or b0[3] < b1[1] or b1[3] < b0[1])
-            if not overlap:
-                warnings.append("Image spatial extents do not overlap")
-
-        return warnings
+    """Validate supported imagery and report compatibility without silently resampling."""
+    def validate(self, image_paths: list[str], metadata: Optional[dict[str,Any]]=None) -> ValidationResult:
+        metadata = metadata or {}; images=[]; errors=[]; warnings=[]
+        for i, path in enumerate(image_paths):
+            try: images.append(self.inspect(path, metadata.get(path, metadata.get(str(i), {}))))
+            except Exception as exc: errors.append(f"{path}: {exc}")
+        warnings.extend(w for im in images for w in im.warnings); warnings.extend(self.compatibility_warnings(images))
+        return ValidationResult(not errors, len(images), images, self.infer_task(images), sorted(set(i.modality for i in images)), errors, warnings)
+    def inspect(self, image_path: str, supplied: Optional[dict[str,Any]]=None) -> ImageMetadata:
+        p=Path(image_path).expanduser().resolve()
+        if not p.is_file(): raise FileNotFoundError("file does not exist")
+        if p.suffix.lower() not in SUPPORTED: raise ValueError(f"unsupported format {p.suffix}; expected GeoTIFF/TIFF/PNG/JPEG")
+        supplied=supplied or {}; date=supplied.get("acquisition_date") or self._date(str(p)); digest=self._hash(p)
+        if p.suffix.lower() in {".tif", ".tiff"}:
+            with rasterio.open(p) as ds:
+                names=supplied.get("bands") or [d or f"Band_{n}" for n,d in enumerate(ds.descriptions,1)]; tags={**ds.tags(), **(ds.tags(1) if ds.count else {})}; warnings=[]
+                if not ds.crs: warnings.append("missing CRS; geographic calculations are unavailable")
+                if ds.transform.is_identity: warnings.append("identity geotransform; image is not georeferenced")
+                if ds.nodata is None: warnings.append("missing nodata value")
+                return ImageMetadata(str(p),p.suffix[1:].lower(),self._modality(supplied.get("modality"),names,ds.count,tags),ds.width,ds.height,ds.count,list(names),str(ds.crs) if ds.crs else None,(abs(ds.transform.a),abs(ds.transform.e)),tuple(ds.bounds),ds.nodata,ds.dtypes[0],date,transform=tuple(ds.transform),sensor_name=supplied.get("sensor_name") or tags.get("SENSOR"),file_sha256=digest,warnings=warnings)
+        with Image.open(p) as im:
+            bands=len(im.getbands())
+            return ImageMetadata(str(p),p.suffix[1:].lower(),supplied.get("modality") or ("optical" if bands in (3,4) else "unknown"),im.width,im.height,bands,supplied.get("bands") or list(im.getbands()),None,None,None,None,str(np.asarray(im).dtype),date,file_sha256=digest,warnings=["non-GeoTIFF image has no CRS/geotransform unless supplied externally"])
+    def compatibility_warnings(self, images):
+        out=[]
+        if len(images)<2:return out
+        if len({x.crs for x in images})>1: out.append("images use different CRS; reproject before pixel-level comparison")
+        if len({(x.width,x.height) for x in images})>1: out.append("images have different dimensions; resample/register before pixel-level comparison")
+        for a,b in zip(images,images[1:]):
+            if a.bounds and b.bounds and (a.bounds[2]<=b.bounds[0] or b.bounds[2]<=a.bounds[0] or a.bounds[3]<=b.bounds[1] or b.bounds[3]<=a.bounds[1]): out.append("images do not overlap spatially")
+        return out
+    def infer_task(self, ims):
+        if len(ims)==1:return "single_image_analysis"
+        return "optical_sar_analysis" if "sar" in {x.modality for x in ims} and len({x.modality for x in ims})>1 else ("bi_temporal_analysis" if len(ims)==2 else "multi_temporal_analysis")
+    @staticmethod
+    def _date(s):
+        m=re.search(r"(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)",s); return "-".join(m.groups()) if m else None
+    @staticmethod
+    def _hash(p):
+        h=hashlib.sha256()
+        with p.open("rb") as f:
+            for c in iter(lambda:f.read(1048576),b""):h.update(c)
+        return h.hexdigest()
+    @staticmethod
+    def _modality(declared,names,count,tags):
+        if declared and declared != "unknown": return str(declared)
+        text=" ".join(map(str,names))+" "+" ".join(f"{k}={v}" for k,v in tags.items())
+        if re.search(r"\b(VV|VH|HH|HV|SAR|SENTINEL-1)\b",text,re.I): return "sar"
+        return "optical" if count==3 else ("multispectral" if count>=4 else "unknown")

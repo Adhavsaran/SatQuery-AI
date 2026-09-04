@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # VLM Configuration
     vlm_provider: str = "huggingface"
-    vlm_model: str = "google/flan-t5-base"  # Placeholder - will use proper VLM
+    vlm_model: str = ""  # Optional: configure an actual remote-sensing VLM checkpoint.
 
     # Data Directories
     data_dir: str = "./data/input"
